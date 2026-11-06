@@ -113,8 +113,8 @@ _INTERVAL_OUTPUT_NRMSE = {("SP8xTP1", "one-token"): 0.035, ("SP4xTP1", "one-toke
     indirect=["mesh_device", "device_params"],
 )
 @pytest.mark.parametrize("interval", list(_INTERVALS))
-# Galaxy's layer runs the output gate beside the relay and the final carry beside the output projection only in a
-# trace (side_windows.py), so its traced replay is checked too.
+# Galaxy's layer runs the output gate beside the relay and the final carry beside the output projection on sub-device
+# managers (side_windows.py); a trace records the manager switches, so its replay is checked too.
 @pytest.mark.parametrize("traced", [False, True], ids=["eager", "traced"])
 @pytest.mark.uncollect_if(
     pred=lambda mesh_device, sequence, traced, **_: traced

@@ -11,8 +11,8 @@ the same time instead of after them:
 * final-carry window: the final carry on the last column, the output projection on the others.
 
 Loading a manager drains the device and clearing it drains it again, so every program before a window has finished
-when it starts, and every program in it before the next one starts. The switches are recorded in the trace. Outside a
-trace no manager is loaded and the programs run one after another on the same cores.
+when it starts, and every program in it before the next one starts. In a trace the switches are recorded with it;
+outside one, each switch's commands go to the devices with the next program's.
 """
 
 from __future__ import annotations
@@ -63,11 +63,6 @@ class SideWindows:
 
     @contextmanager
     def _window(self, manager):
-        # Outside a trace the layer is bound by the host's time to queue it, which a switch adds to (about 45 us of
-        # host time each) while the window saves only device time; the programs then run one after another.
-        if not ttnn.device.is_trace_capture_active(self._mesh_device):
-            yield
-            return
         self._mesh_device.load_sub_device_manager(manager)
         try:
             yield
