@@ -134,6 +134,8 @@ SystemMemoryManager::SystemMemoryManager(MetalEnvImpl& env, MetalContext& ctx, C
     prefetch_q_dev_fences(num_hw_cqs),
     // The ring starts zeroed, which reads as phase 0, so the first lap writes phase 1.
     prefetch_q_phases(num_hw_cqs, 1) {
+    // Sized once: CQs of the device may be driven from different threads.
+    this->deferred_commands_.resize(num_hw_cqs);
     this->prefetch_q_windows.reserve(num_hw_cqs);
     this->completion_q_windows.reserve(num_hw_cqs);
 
@@ -199,6 +201,8 @@ SystemMemoryManager::SystemMemoryManager(MetalEnvImpl& env, MetalContext& ctx, C
     ChipId mmio_device_id = env_.get_cluster().get_associated_mmio_device(device_id);
     uint16_t channel = env_.get_cluster().get_assigned_channel_for_device(device_id);
     char* hugepage_start = static_cast<char*>(env_.get_cluster().host_dma_address(0, mmio_device_id, channel));
+    // Where issue_queue_push_back mirrors the write pointer: Cluster::write_sysmem's offset 0 for this channel.
+    this->host_ptr_mirror_base_ = hugepage_start;
     hugepage_start += (channel >> 2) * DispatchSettings::MAX_DEV_CHANNEL_SIZE;
     this->cq_sysmem_start = hugepage_start;
 
@@ -418,6 +422,12 @@ void SystemMemoryManager::set_issue_queue_size(const uint8_t cq_id, const uint32
 }
 
 void SystemMemoryManager::set_bypass_mode(const bool enable, const bool clear) {
+    if (enable && !this->bypass_enable) {
+        // Deferred commands belong before what bypass mode captures.
+        for (uint8_t cq_id = 0; cq_id < this->deferred_commands_.size(); cq_id++) {
+            this->flush_deferred_commands(cq_id);
+        }
+    }
     this->bypass_enable = enable;
     if (clear) {
         this->bypass_buffer.clear();
@@ -516,6 +526,45 @@ ChipId SystemMemoryManager::get_device_id() const { return this->device_id; }
 std::vector<SystemMemoryCQInterface>& SystemMemoryManager::get_cq_interfaces() { return this->cq_interfaces; }
 
 void* SystemMemoryManager::issue_queue_reserve(uint32_t cmd_size_B, const uint8_t cq_id) {
+    this->flush_deferred_commands(cq_id);
+    return this->issue_queue_reserve_impl(cmd_size_B, cq_id);
+}
+
+void SystemMemoryManager::defer_commands(std::shared_ptr<const std::vector<uint32_t>> commands, const uint8_t cq_id) {
+    this->flush_deferred_commands(cq_id);
+    this->deferred_commands_.at(cq_id) = std::move(commands);
+    if (is_mock_device() || this->bypass_enable) {
+        this->flush_deferred_commands(cq_id);
+    }
+}
+
+void SystemMemoryManager::flush_deferred_commands(const uint8_t cq_id) {
+    if (cq_id >= this->deferred_commands_.size() || !this->deferred_commands_[cq_id]) {
+        return;
+    }
+    const auto commands = std::move(this->deferred_commands_[cq_id]);
+    this->deferred_commands_[cq_id].reset();
+    const uint32_t size = commands->size() * sizeof(uint32_t);
+    this->issue_queue_reserve_impl(size, cq_id);
+    this->cq_write(commands->data(), size, this->get_issue_queue_write_ptr(cq_id));
+    this->issue_queue_push_back(size, cq_id);
+    this->fetch_queue_reserve_back(cq_id);
+    this->fetch_queue_write(size, cq_id);
+}
+
+uint32_t SystemMemoryManager::issue_queue_reserve_after_deferred(
+    uint32_t cmd_size_B, const uint8_t cq_id, uint32_t& deferred_size_B) {
+    deferred_size_B = this->deferred_commands_size(cq_id);
+    this->issue_queue_reserve_impl(deferred_size_B + cmd_size_B, cq_id);
+    const uint32_t write_ptr = this->get_issue_queue_write_ptr(cq_id);
+    if (deferred_size_B != 0) {
+        this->cq_write(this->deferred_commands_[cq_id]->data(), deferred_size_B, write_ptr);
+        this->deferred_commands_[cq_id].reset();
+    }
+    return write_ptr + deferred_size_B;
+}
+
+void* SystemMemoryManager::issue_queue_reserve_impl(uint32_t cmd_size_B, const uint8_t cq_id) {
     if (is_mock_device()) {
         thread_local std::array<char, 65536> dummy_buffer{};
         return dummy_buffer.data();
@@ -633,7 +682,16 @@ void SystemMemoryManager::issue_queue_push_back(uint32_t push_size_B, const uint
         return;
     }
 
-    // Also store this data in hugepages, so if a hang happens we can see what was written by host.
+    // Also store this data in hugepages, so if a hang happens we can see what was written by host. A plain store into
+    // the mapped hugepage, as Cluster::write_sysmem does through UMD, without its lookups on every push.
+    if (this->host_ptr_mirror_base_ != nullptr) {
+        const uint32_t value = cq_interface.issue_fifo_wr_ptr;
+        std::memcpy(
+            this->host_ptr_mirror_base_ + issue_q_wr_ptr + get_relative_cq_offset(cq_id, this->cq_size),
+            &value,
+            sizeof(value));
+        return;
+    }
     ChipId mmio_device_id = env_.get_cluster().get_associated_mmio_device(this->device_id);
     uint16_t channel = env_.get_cluster().get_assigned_channel_for_device(this->device_id);
     env_.get_cluster().write_sysmem(

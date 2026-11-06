@@ -80,7 +80,23 @@ public:
 
     std::vector<SystemMemoryCQInterface>& get_cq_interfaces();
 
+    // Writes any deferred commands (defer_commands) first, as their own fetch queue entry.
     void* issue_queue_reserve(uint32_t cmd_size_B, uint8_t cq_id);
+
+    // Holds `commands` back so that the next command written through issue_queue_reserve_after_deferred
+    // shares their fetch queue entry, saving the entry's write to the device (about 0.3 us). A sub-device manager
+    // switch defers its commands to the next program this way. Any other issue_queue_reserve writes them first. Writes
+    // them at once in bypass mode or on a mock device.
+    void defer_commands(std::shared_ptr<const std::vector<uint32_t>> commands, uint8_t cq_id);
+    uint32_t deferred_commands_size(uint8_t cq_id) const {
+        return cq_id < deferred_commands_.size() && deferred_commands_[cq_id]
+                   ? deferred_commands_[cq_id]->size() * sizeof(uint32_t)
+                   : 0;
+    }
+    // Reserves room for the deferred commands and cmd_size_B more, and writes the deferred commands. Returns the write
+    // pointer after them, where the caller writes its command; it then pushes back and fetches deferred_size +
+    // cmd_size_B as one entry.
+    uint32_t issue_queue_reserve_after_deferred(uint32_t cmd_size_B, uint8_t cq_id, uint32_t& deferred_size_B);
 
     void cq_write(const void* data, uint32_t size_in_bytes, uint32_t write_ptr);
 
@@ -127,6 +143,13 @@ private:
     ChipId device_id = 0;
     std::vector<uint32_t> completion_byte_addrs;
     char* cq_sysmem_start = nullptr;
+    // Start of the hugepage mapping the issue write pointer mirror is stored at (issue_queue_push_back).
+    char* host_ptr_mirror_base_ = nullptr;
+    // Per CQ, commands held back by defer_commands.
+    std::vector<std::shared_ptr<const std::vector<uint32_t>>> deferred_commands_;
+    void* issue_queue_reserve_impl(uint32_t cmd_size_B, uint8_t cq_id);
+    // Writes the deferred commands, if any, as their own fetch queue entry.
+    void flush_deferred_commands(uint8_t cq_id);
     std::vector<SystemMemoryCQInterface> cq_interfaces;
     uint32_t cq_size = 0;
     uint32_t channel_offset = 0;

@@ -155,24 +155,26 @@ void DataCollector::RecordProgramMetadata(ProgramImpl& program) {
 }
 
 void DataCollector::RecordProgramSubDevice(
-    tt::ChipId device_id,
+    [[maybe_unused]] tt::ChipId device_id,
     uint64_t sub_device_manager_id,
     uint64_t runtime_id,
     SubDeviceId sub_device_id,
     uint32_t num_available_worker_cores) {
     std::lock_guard<std::mutex> lock(runtime_id_to_sub_device_mutex_);
-    runtime_id_to_sub_device[std::make_pair(device_id, static_cast<uint16_t>(runtime_id))] =
+    if (runtime_id_to_sub_device_.empty()) {
+        runtime_id_to_sub_device_.resize(kRuntimeIdSlots);
+    }
+    runtime_id_to_sub_device_[static_cast<uint16_t>(runtime_id)] =
         tt::ProgramSubDeviceInfo{*sub_device_id, sub_device_manager_id, num_available_worker_cores};
 }
 
 std::optional<tt::ProgramSubDeviceInfo> DataCollector::GetProgramSubDevice(
-    tt::ChipId device_id, uint64_t runtime_id) const {
+    [[maybe_unused]] tt::ChipId device_id, uint64_t runtime_id) const {
     std::lock_guard<std::mutex> lock(runtime_id_to_sub_device_mutex_);
-    auto it = runtime_id_to_sub_device.find(std::make_pair(device_id, static_cast<uint16_t>(runtime_id)));
-    if (it == runtime_id_to_sub_device.end()) {
+    if (runtime_id_to_sub_device_.empty()) {
         return std::nullopt;
     }
-    return it->second;
+    return runtime_id_to_sub_device_[static_cast<uint16_t>(runtime_id)];
 }
 
 tt::ProgramRealtimeProfilerCallbackHandle DataCollector::RegisterProgramRealtimeProfilerCallback(

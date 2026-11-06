@@ -110,12 +110,11 @@ public:
     }
 
     void record(const std::vector<Device*>& devices, uint64_t runtime_id, SubDeviceId sub_device_id) const {
-        if (!enabled_) {
+        // The record does not depend on the device (DataCollector::RecordProgramSubDevice).
+        if (!enabled_ || devices.empty()) {
             return;
         }
-        for (const auto* device : devices) {
-            record(device->id(), runtime_id, sub_device_id);
-        }
+        record(devices.front()->id(), runtime_id, sub_device_id);
     }
 
 private:
@@ -1349,17 +1348,41 @@ void FDMeshCommandQueue::reset_worker_state(
     }
     std::rotate(sub_device_setup_commands_.begin(), cached, std::next(cached));
     cached = sub_device_setup_commands_.begin();
+    // Old-manager completion counts remain dynamic. The cached tail still resets GO mailboxes
+    // and retains all barriers; batching changes only host submission granularity. The reset is the same on every
+    // device: build it once. When it and the setup fit one fetch, each device holds them back for its next program,
+    // which then shares their fetch queue entry (write_program_commands_to_devices); any other command writes them
+    // first (SystemMemoryManager::issue_queue_reserve).
+    const auto reset_commands = program_dispatch::build_worker_dispatch_reset_commands(
+        mesh_device_,
+        expected_num_workers_completed_,
+        cq_shared_state_->worker_launch_message_buffer_state,
+        reset_launch_msg_state);
+    const uint32_t max_fetch_size =
+        MetalContext::instance(mesh_device_->impl().get_context_id()).dispatch_mem_map().max_prefetch_command_size();
+    // Devices whose setup is the same share one copy of the deferred commands.
+    std::shared_ptr<const std::vector<uint32_t>> shared_commands;
+    const vector_aligned<uint32_t>* shared_setup = nullptr;
     for (size_t i = 0; i < devices.size(); ++i) {
-        // Old-manager completion counts remain dynamic. The cached tail still resets GO mailboxes
-        // and retains all barriers; batching changes only host submission granularity.
-        program_dispatch::reset_worker_dispatch_state_on_device(
-            mesh_device_,
-            devices[i]->sysmem_manager(),
-            id_,
-            expected_num_workers_completed_,
-            cq_shared_state_->worker_launch_message_buffer_state,
-            reset_launch_msg_state,
-            cached->device_batches[i]);
+        const auto& batches = cached->device_batches[i];
+        const size_t setup_size = batches.empty() ? 0 : batches.front().size();
+        if (batches.size() <= 1 && (reset_commands.size() + setup_size) * sizeof(uint32_t) <= max_fetch_size) {
+            const bool same_setup =
+                shared_commands && (batches.empty() ? shared_setup == nullptr
+                                                    : shared_setup != nullptr && *shared_setup == batches.front());
+            if (!same_setup) {
+                auto commands = std::make_shared<std::vector<uint32_t>>(reset_commands.begin(), reset_commands.end());
+                if (!batches.empty()) {
+                    commands->insert(commands->end(), batches.front().begin(), batches.front().end());
+                }
+                shared_commands = std::move(commands);
+                shared_setup = batches.empty() ? nullptr : &batches.front();
+            }
+            devices[i]->sysmem_manager().defer_commands(shared_commands, id_);
+            continue;
+        }
+        program_dispatch::write_worker_dispatch_reset_commands(
+            devices[i]->sysmem_manager(), id_, reset_commands, batches);
     }
     program_dispatch::reset_config_buf_mgrs_and_expected_workers(
         MetalContext::instance(mesh_device_->impl().get_context_id()).hal(),
@@ -1395,13 +1418,21 @@ void FDMeshCommandQueue::write_program_commands_to_devices(
             static thread_local vector_aligned<uint32_t> packed;
             program_dispatch::pack_program_command_sequence(
                 program_cmd_seq, stall_first, stall_before_program, true, packed);
+            const uint32_t max_fetch_size = program_cmd_seq.ctx->dispatch_mem_map().max_prefetch_command_size();
             for (auto* device : devices) {
                 auto& manager = device->sysmem_manager();
-                manager.issue_queue_reserve(size, id_);
-                manager.cq_write(packed.data(), size, manager.get_issue_queue_write_ptr(id_));
-                manager.issue_queue_push_back(size, id_);
+                // A sub-device manager switch's deferred commands share the program's fetch queue entry.
+                uint32_t deferred_size = 0;
+                if (manager.deferred_commands_size(id_) + size <= max_fetch_size) {
+                    const uint32_t write_ptr = manager.issue_queue_reserve_after_deferred(size, id_, deferred_size);
+                    manager.cq_write(packed.data(), size, write_ptr);
+                } else {
+                    manager.issue_queue_reserve(size, id_);
+                    manager.cq_write(packed.data(), size, manager.get_issue_queue_write_ptr(id_));
+                }
+                manager.issue_queue_push_back(deferred_size + size, id_);
                 manager.fetch_queue_reserve_back(id_);
-                manager.fetch_queue_write(size, id_);
+                manager.fetch_queue_write(deferred_size + size, id_);
             }
             return;
         }

@@ -125,7 +125,9 @@ private:
     std::unordered_set<std::string> unique_kernel_sources_;
     std::unordered_map<uint64_t, std::vector<std::string_view>> program_id_to_kernel_sources_;
     std::array<std::atomic<const std::vector<std::string_view>*>, kRuntimeIdSlots> runtime_id_to_kernel_sources_{};
-    std::map<std::pair<tt::ChipId, uint64_t>, tt::ProgramSubDeviceInfo> runtime_id_to_sub_device;
+    // Indexed by the runtime id's low 16 bits, which a launch message carries. A workload runs on one sub-device of one
+    // manager on every device, so the entry does not depend on the device. Sized on first use.
+    std::vector<std::optional<tt::ProgramSubDeviceInfo>> runtime_id_to_sub_device_;
     mutable std::mutex runtime_id_to_sub_device_mutex_;
     mutable std::mutex program_realtime_profiler_callbacks_mutex_;
     std::vector<RealtimeCallbackRegistration> program_realtime_profiler_callbacks_;
