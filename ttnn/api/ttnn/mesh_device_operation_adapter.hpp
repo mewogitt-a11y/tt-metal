@@ -397,6 +397,10 @@ public:
             // WorkloadDescriptor variant only, when resolve_bindings bailed: the tensor buffer addresses
             // baked into the cached program, which a cache hit can only reuse if they are unchanged.
             std::vector<uint32_t> unpatchable_buffer_addresses;
+            // WorkloadDescriptor variant: the buffer addresses resolved_bindings last wrote into the program. A hit
+            // whose buffers kept them would rewrite each binding with the value it holds, so it leaves the program
+            // alone (empty until the first hit applies them).
+            std::vector<uint32_t> applied_buffer_addresses;
         };
         using cached_mesh_workload_t = AdaptedCachedMeshWorkload<shared_variables_t>;
 
@@ -697,6 +701,11 @@ public:
             const operation_attributes_t& attrs,
             const tensor_args_t& tensor_args,
             tensor_return_value_t& tensor_return_value) {
+            // WorkloadDescriptor variant: every program's shared variables hold a copy of the one workload
+            // descriptor, so the buffers (and their addresses) are the same for all of them. Collected once, on first
+            // use.
+            std::optional<CollectedTensorBuffers> workload_buffers;
+            std::vector<uint32_t> workload_buffer_addresses;
             for (auto& [coordinate_range, program] : cached_workload.workload.get_programs()) {
                 auto& sv = cached_workload.shared_variables.at(coordinate_range);
 
@@ -708,9 +717,16 @@ public:
                     // fast path covers cache hits even when the factory only sets
                     // `desc.cbs[i].buffer` and declares no rt-arg buffer bindings.
                     if (!sv.resolved_bindings.empty()) {
-                        auto collected =
-                            collect_tensor_buffers(tensor_args, tensor_return_value, sv.workload_descriptor);
-                        tt::tt_metal::apply_resolved_bindings(program, sv.resolved_bindings, collected.buffers);
+                        if (!workload_buffers.has_value()) {
+                            workload_buffers =
+                                collect_tensor_buffers(tensor_args, tensor_return_value, sv.workload_descriptor);
+                            workload_buffer_addresses = buffer_addresses(workload_buffers->buffers);
+                        }
+                        if (sv.applied_buffer_addresses != workload_buffer_addresses) {
+                            tt::tt_metal::apply_resolved_bindings(
+                                program, sv.resolved_bindings, workload_buffers->buffers);
+                            sv.applied_buffer_addresses = workload_buffer_addresses;
+                        }
                     } else if (!has_override_runtime_arguments() && !sv.unpatchable_buffer_addresses.empty()) {
                         // Overrides are exempt: some rewrite every buffer address themselves (e.g.
                         // minimal_matmul_strided_reduce_scatter_async), and the adapter cannot tell which.
@@ -896,6 +912,9 @@ public:
             // outlive the cache miss and every program on the occupied ranges can reference them.
             // Shared ownership keeps the device allocation alive for the life of the cache entry.
             std::shared_ptr<std::vector<tt::tt_metal::MeshTensor>> op_owned_tensors;
+            // The address each binding's tensor had when the program was last refreshed: a hit that finds every one
+            // unchanged leaves the program as it is (empty until the first hit records them).
+            std::vector<tt::tt_metal::DeviceAddr> bound_addresses;
         };
 
         // Cache-hit tensor refresh, shared so the two adapters' hit paths cannot drift apart.
@@ -907,7 +926,7 @@ public:
             const auto io_mesh_tensors = collect_mesh_tensors(tensor_args, tensor_return_value);
             const bool skip_validation = !ttnn::CONFIG.get<"validate_program_args">();
             for (auto& [coordinate_range, program] : cached_workload.workload.get_programs()) {
-                const auto& sv = cached_workload.shared_variables.at(coordinate_range);
+                auto& sv = cached_workload.shared_variables.at(coordinate_range);
 
                 // Reproduce the cache-miss enumeration: fresh io tensors, then the
                 // parked op-owned tensors (stable addresses, retrieved from the cache).
@@ -916,6 +935,19 @@ public:
                     for (const auto& op_owned_tensor : *sv.op_owned_tensors) {
                         mesh_tensors.push_back(std::cref(op_owned_tensor));
                     }
+                }
+
+                // A hit matches every spec the program was built for, so a binding whose tensor kept its address
+                // would be rewritten with the value it holds: skip the program when every binding did.
+                bool unchanged = sv.bound_addresses.size() == sv.bindings.size();
+                sv.bound_addresses.resize(sv.bindings.size());
+                for (std::size_t i = 0; i < sv.bindings.size(); ++i) {
+                    const auto address = mesh_tensors[sv.bindings[i].tensor_idx].get().address();
+                    unchanged = unchanged && sv.bound_addresses[i] == address;
+                    sv.bound_addresses[i] = address;
+                }
+                if (unchanged) {
+                    continue;
                 }
 
                 tt::tt_metal::experimental::Table<TensorParamName, TensorArgument> fresh_tensor_args;
