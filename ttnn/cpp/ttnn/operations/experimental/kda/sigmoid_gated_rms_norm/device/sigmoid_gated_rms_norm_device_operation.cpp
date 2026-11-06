@@ -42,6 +42,14 @@ SigmoidGatedRmsNormOperation::program_factory_t SigmoidGatedRmsNormOperation::se
 void SigmoidGatedRmsNormOperation::validate_on_program_cache_miss(
     const operation_attributes_t& attrs, const tensor_args_t& in) {
     check_tiled_device(in.input, "input", {DataType::FLOAT32, DataType::BFLOAT16});
+    if (attrs.grid) {
+        const auto device_grid = in.input.device()->compute_with_storage_grid_size();
+        TT_FATAL(
+            attrs.grid->x > 0 && attrs.grid->y > 0 && attrs.grid->x <= device_grid.x && attrs.grid->y <= device_grid.y,
+            "sigmoid_gated_rms_norm: grid {} must be non-empty and fit the device's worker grid {}",
+            *attrs.grid,
+            device_grid);
+    }
     check_tiled_device(in.gate, "gate", {DataType::BFLOAT16});
     check_tiled_device(in.weight, "weight", {DataType::BFLOAT16});
     TT_FATAL(
@@ -144,7 +152,8 @@ Tensor sigmoid_gated_rms_norm(
     const DeviceComputeKernelConfig& compute_kernel_config,
     DataType output_dtype,
     uint32_t gate_column_offset,
-    const std::optional<Tensor>& gate_tail) {
+    const std::optional<Tensor>& gate_tail,
+    const std::optional<CoreCoord>& grid) {
     const auto& input_shape = input.logical_shape();
     TT_FATAL(input_shape.rank() == 3, "sigmoid_gated_rms_norm: input must be [B*H,T,V]");
     TT_FATAL(num_heads > 0, "sigmoid_gated_rms_norm: num_heads must be positive");
@@ -161,7 +170,8 @@ Tensor sigmoid_gated_rms_norm(
             .output_mem_config = output_mem_config,
             .output_dtype = output_dtype,
             .compute_kernel_config = compute_kernel_config,
-            .gate_column_offset = gate_column_offset},
+            .gate_column_offset = gate_column_offset,
+            .grid = grid},
         SigmoidGatedRmsNormInputs{.input = input, .gate = gate, .weight = weight, .gate_tail = gate_tail});
     return results[0];
 }

@@ -573,6 +573,8 @@ class ttKDA:
             output_dtype=self.gated_rms_output_dtype,
             gate_column_offset=output_gate_offset,
             gate_tail=output_gate_tail,
+            # With side windows it runs under the final carry's manager, on the columns beside the carry's.
+            grid=None if self._side_windows is None else self._side_windows.projection_grid,
         )
 
     def _project_output(

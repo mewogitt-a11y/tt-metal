@@ -62,17 +62,23 @@ class SideWindows:
         )
 
     @contextmanager
-    def _window(self, manager):
-        self._mesh_device.load_sub_device_manager(manager)
+    def relay(self):
+        """The relay on relay_cores, the output gate's projection on gate_grid. It ends in the final carry's manager:
+        what runs until final_carry() (the entry correction and the norm) must keep to projection_grid."""
+        self._mesh_device.load_sub_device_manager(self._relay_manager)
+        try:
+            yield
+        except BaseException:
+            self._mesh_device.clear_loaded_sub_device_manager()
+            raise
+        # One switch to the next window instead of two through the default manager.
+        self._mesh_device.load_sub_device_manager(self._carry_manager)
+
+    @contextmanager
+    def final_carry(self):
+        """The final carry on the last worker column, the output projection on projection_grid."""
+        self._mesh_device.load_sub_device_manager(self._carry_manager)  # A no-op after relay().
         try:
             yield
         finally:
             self._mesh_device.clear_loaded_sub_device_manager()
-
-    def relay(self):
-        """The relay on relay_cores, the output gate's projection on gate_grid."""
-        return self._window(self._relay_manager)
-
-    def final_carry(self):
-        """The final carry on the last worker column, the output projection on projection_grid."""
-        return self._window(self._carry_manager)

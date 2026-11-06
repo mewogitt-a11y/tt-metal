@@ -566,7 +566,13 @@ class KDARecurrence:
                 num_chunks=local_rows // KDA_CHUNK_SIZE,
                 key_dim=key_dim,
                 local_rows=local_rows,
-                cores=[ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)][:max_cores],
+                # With side windows it runs between them, under the final carry's manager: on the columns beside
+                # the carry's.
+                cores=[
+                    ttnn.CoreCoord(x, y)
+                    for y in range(grid.y)
+                    for x in range(grid.x if side_windows is None else side_windows.projection_grid.x)
+                ][:max_cores],
                 math_fidelity=program_config.scan_math_fidelity,
             )
         if side_windows is not None and not self._sequence_parallel:

@@ -24,6 +24,8 @@ struct SigmoidGatedRmsNormParams {
     DeviceComputeKernelConfig compute_kernel_config;
     // Gate columns start at this element offset within each row of the gate tensor.
     uint32_t gate_column_offset = 0;
+    // The worker grid from the origin to spread over; the device's whole grid when unset.
+    std::optional<CoreCoord> grid;
 };
 
 struct SigmoidGatedRmsNormInputs {

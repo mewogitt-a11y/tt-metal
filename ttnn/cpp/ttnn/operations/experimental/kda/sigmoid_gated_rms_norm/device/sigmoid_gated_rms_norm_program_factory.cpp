@@ -37,7 +37,7 @@ ttnn::device_operation::ProgramArtifacts SigmoidGatedRmsNormProgramFactory::crea
     const uint32_t Vt = attrs.value_dim / TILE_WIDTH;
     const uint32_t total = attrs.batch * attrs.num_heads * Mt;
     // Use the fewest workers that preserve the all-core maximum items/worker.
-    const auto grid = device.compute_with_storage_grid_size();
+    const auto grid = attrs.grid.value_or(device.compute_with_storage_grid_size());
     const uint32_t max_items_per_core = tt::div_up(total, grid.x * grid.y);
     const uint32_t rms_core_limit = tt::div_up(total, max_items_per_core);
     auto dist = kda_factory_detail::distribute_prep(grid, total, rms_core_limit);
