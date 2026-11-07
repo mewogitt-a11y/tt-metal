@@ -24,6 +24,22 @@ PrepareChunkRecurrenceOperation::program_factory_t PrepareChunkRecurrenceOperati
     return PrepareChunkRecurrenceProgramFactory{};
 }
 
+// A cache hit matches every attribute and tensor spec the miss validated: only where the tensors live can differ.
+void PrepareChunkRecurrenceOperation::validate_on_program_cache_hit(
+    const operation_attributes_t&, const tensor_args_t& in) {
+    kda_factory_detail::check_allocated_on_device(
+        in.q,
+        {{&in.q, "q"},
+         {&in.k, "k"},
+         {&in.v, "v"},
+         {&in.g, "g"},
+         {&in.beta, "beta"},
+         {in.actual_start ? &*in.actual_start : nullptr, "actual_start"},
+         {in.actual_end ? &*in.actual_end : nullptr, "actual_end"},
+         {in.sp_rank ? &*in.sp_rank : nullptr, "sp_rank"}},
+        "prepare_chunk_recurrence");
+}
+
 void PrepareChunkRecurrenceOperation::validate_on_program_cache_miss(
     const operation_attributes_t& attrs, const tensor_args_t& in) {
     using namespace kda_factory_detail;
