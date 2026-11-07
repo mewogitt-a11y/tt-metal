@@ -1353,6 +1353,8 @@ public:
     // deliberately exclude some, e.g. an RNG seed), so we return only the op-identity prefix --
     // opting that op out of attribute-level collision resolution. The default reflection-hash
     // path is mirrored exactly.
+    static constexpr std::size_t kCanonicalKeyReserveBytes = 2048;
+
     static std::string compute_mesh_workload_canonical_key(
         [[maybe_unused]] tt::tt_metal::distributed::MeshDevice* mesh_device,
         std::string_view op_type_name,
@@ -1362,10 +1364,14 @@ public:
         if constexpr (requires { DeviceOperation::compute_program_hash(attrs, tensor_args); }) {
             return key;  // custom hash -> opt out beyond the op-identity prefix
         } else {
-            key += ttsl::hash::canonical_key(attrs, tensor_args);
+            // Built on every call, cache hits included: encode into one string, with room for a typical key, instead
+            // of growing it step by step and concatenating temporaries. The bytes are canonical_key's.
+            key.reserve(kCanonicalKeyReserveBytes);
+            ttsl::hash::detail::append_canonical_all(key, attrs, tensor_args);
             const auto coords = mesh_device_operation_utils::extract_tensor_coordinates(tensor_args, mesh_device);
-            std::for_each(
-                coords.begin(), coords.end(), [&](const auto& coord) { key += ttsl::hash::canonical_key(coord); });
+            std::for_each(coords.begin(), coords.end(), [&](const auto& coord) {
+                ttsl::hash::detail::append_canonical(key, coord);
+            });
             return key;
         }
     }
