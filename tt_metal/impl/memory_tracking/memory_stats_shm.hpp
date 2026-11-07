@@ -118,12 +118,20 @@ public:
     // Record an allocation (updates aggregated, per-chip, and optionally per-PID stats)
     // This is called on every buffer allocation (fast path - ~20-50ns)
     // chip_id: Metal chip ID where this buffer is allocated (for remote chip tracking)
-    void record_allocation(pid_t pid, uint64_t size, ShmBufferType type, uint32_t chip_id = 0);
+    // timestamp_ns: the update time to store; 0 reads the clock. A caller recording one buffer on many devices reads it
+    // once and passes it to each.
+    void record_allocation(
+        pid_t pid, uint64_t size, ShmBufferType type, uint32_t chip_id = 0, uint64_t timestamp_ns = 0);
+
+    // Current time in nanoseconds since the epoch, as the region's timestamps store it
+    static uint64_t current_timestamp_ns();
 
     // Record a deallocation (updates aggregated, per-chip, and optionally per-PID stats)
     // This is called on every buffer deallocation (fast path - ~20-50ns)
     // chip_id: Metal chip ID where this buffer was allocated
-    void record_deallocation(pid_t pid, uint64_t size, ShmBufferType type, uint32_t chip_id = 0);
+    // timestamp_ns: as for record_allocation
+    void record_deallocation(
+        pid_t pid, uint64_t size, ShmBufferType type, uint32_t chip_id = 0, uint64_t timestamp_ns = 0);
 
     // Get current device-wide statistics (read-only, no locks)
     struct DeviceStats {
@@ -203,8 +211,12 @@ private:
     // Helper: Find or create per-chip stats entry
     DeviceMemoryRegion::ChipStats* find_or_create_chip_entry(uint32_t chip_id);
 
-    // Helper: Get current timestamp in nanoseconds
-    static uint64_t current_timestamp_ns();
+    // record_allocation / record_deallocation's entries: the last ones found, checked before reuse since another
+    // process may reclaim a slot. Calls that record are serialized by their caller (ShmTrackingProcessor).
+    DeviceMemoryRegion::ProcessStats* recorded_pid_entry(pid_t pid);
+    DeviceMemoryRegion::ChipStats* recorded_chip_entry(uint32_t chip_id);
+    DeviceMemoryRegion::ProcessStats* last_pid_entry_ = nullptr;
+    DeviceMemoryRegion::ChipStats* last_chip_entry_ = nullptr;
 
     // Helper: Get process name from PID
     static std::string get_process_name(pid_t pid);

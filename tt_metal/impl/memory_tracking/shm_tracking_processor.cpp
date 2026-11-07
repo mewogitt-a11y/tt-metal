@@ -8,10 +8,32 @@
 #include <tt-metalium/buffer.hpp>
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-logger/tt-logger.hpp>
+#include <pthread.h>
 #include <unistd.h>
+#include <atomic>
 #include "distributed/mesh_device_impl.hpp"
 
 namespace tt::tt_metal {
+
+namespace {
+
+// getpid() is a system call, and every buffer allocation and deallocation records its pid. Read it once per process;
+// a forked child reads its own.
+std::atomic<pid_t> cached_pid{0};
+
+pid_t current_pid() {
+    static const int fork_handler_registered =
+        pthread_atfork(nullptr, nullptr, [] { cached_pid.store(0, std::memory_order_relaxed); });
+    (void)fork_handler_registered;
+    pid_t pid = cached_pid.load(std::memory_order_relaxed);
+    if (pid == 0) {
+        pid = getpid();
+        cached_pid.store(pid, std::memory_order_relaxed);
+    }
+    return pid;
+}
+
+}  // namespace
 
 // Convert BufferType to ShmBufferType for shared memory tracking
 static ShmBufferType to_shm_buffer_type(BufferType type) {
@@ -49,8 +71,9 @@ void ShmTrackingProcessor::track_allocate(const Buffer* buffer) {
         auto underlying_devices = mesh_device->impl().get_devices();
         size_t num_tracked = 0;
         uint64_t size_per_device = buffer->size();
-        // getpid() is a syscall; take it once per buffer, not once per device of the mesh.
-        const pid_t pid = getpid();
+        // The clock is not free: read it once per buffer, not once per device of the mesh.
+        const pid_t pid = current_pid();
+        const uint64_t timestamp_ns = SharedMemoryStatsProvider::current_timestamp_ns();
 
         // Track on all underlying Devices that have SHM provider
         for (auto* underlying_device : underlying_devices) {
@@ -74,7 +97,8 @@ void ShmTrackingProcessor::track_allocate(const Buffer* buffer) {
                         pid,
                         size_per_device,
                         to_shm_buffer_type(buffer->buffer_type()),
-                        static_cast<uint32_t>(device->id()));
+                        static_cast<uint32_t>(device->id()),
+                        timestamp_ns);
                     num_tracked++;
                 }
             }
@@ -118,10 +142,10 @@ void ShmTrackingProcessor::track_allocate(const Buffer* buffer) {
                     buffer->device()->id(),
                     static_cast<unsigned>(buffer->buffer_type()),
                     buffer->size(),
-                    getpid());
+                    current_pid());
             }
             shm_provider->record_allocation(
-                getpid(),
+                current_pid(),
                 buffer->size(),
                 to_shm_buffer_type(buffer->buffer_type()),
                 static_cast<uint32_t>(buffer->device()->id()));
@@ -185,7 +209,8 @@ void ShmTrackingProcessor::track_deallocate(Buffer* buffer) {
 
         auto underlying_devices = mesh_device->impl().get_devices();
         uint64_t size_per_device = buffer->size();
-        const pid_t pid = getpid();
+        const pid_t pid = current_pid();
+        const uint64_t timestamp_ns = SharedMemoryStatsProvider::current_timestamp_ns();
 
         // Track deallocation on all underlying Devices that have SHM provider
         for (auto* underlying_device : underlying_devices) {
@@ -198,7 +223,8 @@ void ShmTrackingProcessor::track_deallocate(Buffer* buffer) {
                         pid,
                         size_per_device,
                         to_shm_buffer_type(buffer->buffer_type()),
-                        static_cast<uint32_t>(device->id()));
+                        static_cast<uint32_t>(device->id()),
+                        timestamp_ns);
                 }
             }
         }
@@ -213,7 +239,7 @@ void ShmTrackingProcessor::track_deallocate(Buffer* buffer) {
         auto* shm_provider = device->get_shm_stats_provider();
         if (shm_provider) {
             shm_provider->record_deallocation(
-                getpid(),
+                current_pid(),
                 buffer->size(),
                 to_shm_buffer_type(buffer->buffer_type()),
                 static_cast<uint32_t>(buffer->device()->id()));

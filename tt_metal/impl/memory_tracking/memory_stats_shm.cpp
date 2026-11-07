@@ -285,7 +285,8 @@ void SharedMemoryStatsProvider::initialize_region() {
     }
 }
 
-void SharedMemoryStatsProvider::record_allocation(pid_t pid, uint64_t size, ShmBufferType type, uint32_t chip_id) {
+void SharedMemoryStatsProvider::record_allocation(
+    pid_t pid, uint64_t size, ShmBufferType type, uint32_t chip_id, uint64_t timestamp_ns) {
     if (!region_) {
         if (verbose_enabled_) {
             log_warning(
@@ -297,6 +298,9 @@ void SharedMemoryStatsProvider::record_allocation(pid_t pid, uint64_t size, ShmB
                 chip_id);
         }
         return;
+    }
+    if (timestamp_ns == 0) {
+        timestamp_ns = current_timestamp_ns();
     }
 
     if (verbose_enabled_) {
@@ -328,7 +332,7 @@ void SharedMemoryStatsProvider::record_allocation(pid_t pid, uint64_t size, ShmB
     }
 
     // Update per-chip counters (for remote device tracking)
-    auto* chip_entry = find_or_create_chip_entry(chip_id);
+    auto* chip_entry = recorded_chip_entry(chip_id);
     if (chip_entry) {
         switch (type) {
             case ShmBufferType::DRAM: chip_entry->dram_allocated.fetch_add(size, std::memory_order_relaxed); break;
@@ -343,28 +347,32 @@ void SharedMemoryStatsProvider::record_allocation(pid_t pid, uint64_t size, ShmB
     }
 
     // Update timestamp
-    region_->last_update_timestamp.store(current_timestamp_ns(), std::memory_order_relaxed);
+    region_->last_update_timestamp.store(timestamp_ns, std::memory_order_relaxed);
 
     // Update per-PID stats if enabled
     if (per_pid_tracking_enabled_) {
-        auto* pid_entry = find_or_create_pid_entry(pid);
+        auto* pid_entry = recorded_pid_entry(pid);
         if (pid_entry) {
+            // Only this process writes its entry, and its callers serialize (ShmTrackingProcessor), so a load and a
+            // store update it without a locked read-modify-write.
+            const auto add = [size](std::atomic<uint64_t>& counter) {
+                counter.store(counter.load(std::memory_order_relaxed) + size, std::memory_order_relaxed);
+            };
             switch (type) {
-                case ShmBufferType::DRAM: pid_entry->dram_allocated.fetch_add(size, std::memory_order_relaxed); break;
-                case ShmBufferType::L1: pid_entry->l1_allocated.fetch_add(size, std::memory_order_relaxed); break;
-                case ShmBufferType::L1_SMALL:
-                    pid_entry->l1_small_allocated.fetch_add(size, std::memory_order_relaxed);
-                    break;
-                case ShmBufferType::TRACE: pid_entry->trace_allocated.fetch_add(size, std::memory_order_relaxed); break;
-                case ShmBufferType::CB: pid_entry->cb_allocated.fetch_add(size, std::memory_order_relaxed); break;
+                case ShmBufferType::DRAM: add(pid_entry->dram_allocated); break;
+                case ShmBufferType::L1: add(pid_entry->l1_allocated); break;
+                case ShmBufferType::L1_SMALL: add(pid_entry->l1_small_allocated); break;
+                case ShmBufferType::TRACE: add(pid_entry->trace_allocated); break;
+                case ShmBufferType::CB: add(pid_entry->cb_allocated); break;
                 default: break;
             }
-            pid_entry->last_update_timestamp.store(current_timestamp_ns(), std::memory_order_relaxed);
+            pid_entry->last_update_timestamp.store(timestamp_ns, std::memory_order_relaxed);
         }
     }
 }
 
-void SharedMemoryStatsProvider::record_deallocation(pid_t pid, uint64_t size, ShmBufferType type, uint32_t chip_id) {
+void SharedMemoryStatsProvider::record_deallocation(
+    pid_t pid, uint64_t size, ShmBufferType type, uint32_t chip_id, uint64_t timestamp_ns) {
     if (!region_) {
         if (verbose_enabled_) {
             log_warning(
@@ -376,6 +384,9 @@ void SharedMemoryStatsProvider::record_deallocation(pid_t pid, uint64_t size, Sh
                 chip_id);
         }
         return;
+    }
+    if (timestamp_ns == 0) {
+        timestamp_ns = current_timestamp_ns();
     }
 
     if (verbose_enabled_) {
@@ -420,7 +431,7 @@ void SharedMemoryStatsProvider::record_deallocation(pid_t pid, uint64_t size, Sh
     }
 
     // Update per-chip counters (with underflow protection)
-    auto* chip_entry = find_or_create_chip_entry(chip_id);
+    auto* chip_entry = recorded_chip_entry(chip_id);
     if (chip_entry) {
         switch (type) {
             case ShmBufferType::DRAM: safe_sub(chip_entry->dram_allocated, size); break;
@@ -433,19 +444,16 @@ void SharedMemoryStatsProvider::record_deallocation(pid_t pid, uint64_t size, Sh
     }
 
     // Update timestamp
-    region_->last_update_timestamp.store(current_timestamp_ns(), std::memory_order_relaxed);
+    region_->last_update_timestamp.store(timestamp_ns, std::memory_order_relaxed);
 
     // Update per-PID stats if enabled (with underflow protection using atomics)
     if (per_pid_tracking_enabled_) {
-        auto* pid_entry = find_or_create_pid_entry(pid);
+        auto* pid_entry = recorded_pid_entry(pid);
         if (pid_entry) {
-            // Helper lambda for atomic subtraction with underflow protection
+            // Subtraction clamped at 0. As in record_allocation, only this process writes its entry.
             auto safe_atomic_sub = [](std::atomic<uint64_t>& counter, uint64_t size) {
-                uint64_t current = counter.load(std::memory_order_relaxed);
-                uint64_t new_val;
-                do {
-                    new_val = (current >= size) ? (current - size) : 0;
-                } while (!counter.compare_exchange_weak(current, new_val, std::memory_order_relaxed));
+                const uint64_t current = counter.load(std::memory_order_relaxed);
+                counter.store(current >= size ? current - size : 0, std::memory_order_relaxed);
             };
 
             switch (type) {
@@ -456,7 +464,7 @@ void SharedMemoryStatsProvider::record_deallocation(pid_t pid, uint64_t size, Sh
                 case ShmBufferType::CB: safe_atomic_sub(pid_entry->cb_allocated, size); break;
                 default: break;
             }
-            pid_entry->last_update_timestamp.store(current_timestamp_ns(), std::memory_order_relaxed);
+            pid_entry->last_update_timestamp.store(timestamp_ns, std::memory_order_relaxed);
         }
     }
 }
@@ -537,6 +545,20 @@ DeviceMemoryRegion::ProcessStats* SharedMemoryStatsProvider::find_or_create_pid_
 
     // No free slots
     return nullptr;
+}
+
+DeviceMemoryRegion::ProcessStats* SharedMemoryStatsProvider::recorded_pid_entry(pid_t pid) {
+    if (last_pid_entry_ == nullptr || last_pid_entry_->pid.load(std::memory_order_relaxed) != pid) {
+        last_pid_entry_ = find_or_create_pid_entry(pid);
+    }
+    return last_pid_entry_;
+}
+
+DeviceMemoryRegion::ChipStats* SharedMemoryStatsProvider::recorded_chip_entry(uint32_t chip_id) {
+    if (last_chip_entry_ == nullptr || last_chip_entry_->chip_id.load(std::memory_order_relaxed) != chip_id) {
+        last_chip_entry_ = find_or_create_chip_entry(chip_id);
+    }
+    return last_chip_entry_;
 }
 
 uint64_t SharedMemoryStatsProvider::current_timestamp_ns() {
