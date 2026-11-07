@@ -85,10 +85,10 @@ _ACTUAL_START_OVERRIDE = os.environ.get("KDA_PERF_ACTUAL_START")
 # Galaxy target: a full chunk whose start falls mid-device. A resumed request starts at an arbitrary aligned
 # prefix, and every full chunk of it then wraps onto its first rank, which adds the final-carry barrier and
 # broadcast that a rank-aligned start skips. Production always passes actual_end, so the gate does too. An
-# untraced call also pays its host dispatch, which a block of 10 calls does not fully hide, and its sub-device manager
-# switches drain the device (side_windows.py) where a trace overlaps the next program's config. Median of 10 runs on
-# c03u08 at base bac3979dbcd (main there: 1.222 traced, 1.240 untraced).
-_GALAXY_PERF_REFERENCE_MS = {"traced": 1.118, "untraced": 1.163}
+# untraced call also pays its host dispatch, which a block of 10 calls does not fully hide: the block's first call
+# starts with the device idle. Median of 10 runs on bh-glx-120-b07u02 at base bac3979dbcd, with CI's settings
+# (shared-memory allocation tracking on, LOGURU_LEVEL=INFO); main there: 1.222 traced, 1.407 untraced.
+_GALAXY_PERF_REFERENCE_MS = {"traced": 1.116, "untraced": 1.139}
 _GALAXY_TP = 4
 _GALAXY_HEADS_PER_CHIP = KimiK3Config.KDA_NUM_HEADS // _GALAXY_TP
 _GALAXY_ACTUAL_START = 4 * PREFILL_CHUNK_TOKENS_PER_CHIP + 320
