@@ -213,6 +213,11 @@ TraceNode create_trace_node(
     uint32_t num_workers,
     bool use_prefetcher_cache);
 
+// pack_program_command_sequence without stalls, for a program whose config and binary go ahead of commands written
+// before its launch (a sub-device manager switch outside a trace). Returns the byte offset of its launch commands.
+uint32_t pack_program_command_sequence_around(
+    const ProgramCommandSequence& program_command_sequence, bool send_binary, vector_aligned<uint32_t>& packed);
+
 // Serialize the same command fragments as write_program_command_sequence for reuse across devices.
 void pack_program_command_sequence(
     const ProgramCommandSequence& program_command_sequence,
@@ -256,7 +261,8 @@ void reset_config_buf_mgrs_and_expected_workers(
     DispatchArray<WorkerConfigBufferMgr>& config_buffer_mgrs,
     DispatchArray<uint32_t>& expected_num_workers_completed,
     uint32_t num_entries_to_reset,
-    uint32_t worker_l1_unreserved_start);
+    uint32_t worker_l1_unreserved_start,
+    const std::vector<uint32_t>& start_hints = {});
 
 void reset_worker_dispatch_state_on_device(
     distributed::MeshDevice* mesh_device,

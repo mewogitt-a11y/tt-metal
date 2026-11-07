@@ -3173,6 +3173,32 @@ void for_each_program_command_sequence_chunk(
         program_command_sequence, stall_first, stall_before_program, send_binary, process_chunk);
 }
 
+uint32_t pack_program_command_sequence_around(
+    const ProgramCommandSequence& program_command_sequence, bool send_binary, vector_aligned<uint32_t>& packed) {
+    packed.clear();
+    auto append = [&](const void* data, uint32_t bytes) {
+        const auto* words = static_cast<const uint32_t*>(data);
+        packed.insert(packed.end(), words, words + bytes / sizeof(uint32_t));
+    };
+    uint32_t launch_offset = 0;
+    for_each_program_command_sequence_chunk_impl(
+        program_command_sequence,
+        /*stall_first=*/false,
+        /*stall_before_program=*/false,
+        send_binary,
+        append,
+        [&]() {
+            // As write_program_command_sequence_around: the config and binary writes complete before what goes ahead
+            // of the launch.
+            const auto& barrier = program_command_sequence.wait_barrier_command_sequence;
+            if (send_binary && barrier.size_bytes() != 0) {
+                append(barrier.data(), barrier.size_bytes());
+            }
+            launch_offset = packed.size() * sizeof(uint32_t);
+        });
+    return launch_offset;
+}
+
 void pack_program_command_sequence(
     const ProgramCommandSequence& program_command_sequence,
     bool stall_first,
@@ -3443,12 +3469,13 @@ void reset_config_buf_mgrs_and_expected_workers(
     DispatchArray<WorkerConfigBufferMgr>& config_buffer_mgrs,
     DispatchArray<uint32_t>& expected_num_workers_completed,
     uint32_t num_entries_to_reset,
-    uint32_t worker_l1_unreserved_start) {
+    uint32_t worker_l1_unreserved_start,
+    const std::vector<uint32_t>& start_hints) {
     // A sub-device manager switch resets these: reuse the managers' storage when their buffers are already right.
     const auto buffers = worker_config_buffers(hal, worker_l1_unreserved_start);
     for (uint32_t i = 0; i < num_entries_to_reset; ++i) {
         if (config_buffer_mgrs[i].has_buffers(buffers)) {
-            config_buffer_mgrs[i].reset();
+            config_buffer_mgrs[i].reset(start_hints);
             continue;
         }
         config_buffer_mgrs[i] = WorkerConfigBufferMgr();

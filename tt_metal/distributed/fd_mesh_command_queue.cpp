@@ -504,6 +504,65 @@ void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
         program_ordering_sync_count,
         dispatch_metadata);
 
+    // The first program after a sub-device manager switch whose commands the devices hold back writes its config and
+    // binary ahead of the switch when nothing it writes can be in use by the previous manager's programs: no stall, no
+    // config off the Tensix kernel config ring (CrossNode configs, ethernet configs or binaries), and its Tensix config
+    // clear of what the previous manager used.
+    bool config_ahead = false;
+    std::vector<uint32_t> config_ahead_waits;
+    if (switch_config_in_use_.has_value()) {
+        const auto in_use = std::move(*switch_config_in_use_);
+        switch_config_in_use_.reset();
+        auto& metal_ctx = MetalContext::instance(mesh_device_->impl().get_context_id());
+        const auto& hal = metal_ctx.hal();
+        const uint32_t tensix_index = hal.get_programmable_core_type_index(HalProgrammableCoreType::TENSIX);
+        config_ahead = !dispatch_metadata.stall_first && !dispatch_metadata.stall_before_program &&
+                       cross_node_program_ids.empty() &&
+                       hal.get_core_kernel_stored_in_config_buffer(HalProgrammableCoreType::TENSIX);
+        for (uint32_t index = 0; config_ahead && index < dispatch_metadata.kernel_config_addrs.size(); index++) {
+            if (index != tensix_index) {
+                config_ahead = program_config_sizes[index] == 0;
+            }
+        }
+        std::map<uint32_t, uint32_t> wait_counts;
+        if (config_ahead) {
+            const auto& entry = dispatch_metadata.kernel_config_addrs[tensix_index];
+            for (const auto& range : in_use) {
+                if (entry.size == 0 || entry.addr + entry.size <= range.lo || entry.addr >= range.hi) {
+                    continue;
+                }
+                if (range.last) {
+                    config_ahead = false;
+                    break;
+                }
+                auto& count = wait_counts[range.sub_device];
+                count = std::max(count, range.finished_count);
+            }
+        }
+        if (config_ahead && !wait_counts.empty()) {
+            // As write_config_space_waits in a trace: the earlier programs whose config this one overwrites finish
+            // first (long before, in practice).
+            const bool distributed_dispatcher = metal_ctx.get_dispatch_query_manager().distributed_dispatcher();
+            DeviceCommandCalculator calculator(metal_ctx);
+            for (size_t i = 0; i < wait_counts.size(); i++) {
+                if (distributed_dispatcher) {
+                    calculator.add_dispatch_wait();
+                }
+                calculator.add_dispatch_wait();
+            }
+            HostMemDeviceCommand command_sequence(metal_ctx, calculator.write_offset_bytes());
+            for (const auto& [sub_device, count] : wait_counts) {
+                const uint32_t stream = metal_ctx.dispatch_mem_map().get_dispatch_stream_index(sub_device);
+                if (distributed_dispatcher) {
+                    command_sequence.add_dispatch_wait(CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM, 0, stream, count, 1);
+                }
+                command_sequence.add_dispatch_wait(CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM, 0, stream, count);
+            }
+            const auto* words = static_cast<const uint32_t*>(command_sequence.data());
+            config_ahead_waits.assign(words, words + command_sequence.size_bytes() / sizeof(uint32_t));
+        }
+    }
+
     const bool covers_entire_mesh = mesh_workload.impl().get_num_program_devices() == mesh_device_->shape().mesh_size();
     std::unordered_set<uint32_t> chip_ids_in_workload;
     if (!covers_entire_mesh) {
@@ -560,7 +619,12 @@ void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
         const auto& local_devices = mesh_device_->impl().get_local_devices(device_range);
         sub_device_recorder.record(local_devices, program.get_runtime_id(), sub_device_id);
         this->write_program_commands_to_devices(
-            local_devices, program_cmd_seq, dispatch_metadata.stall_first, dispatch_metadata.stall_before_program);
+            local_devices,
+            program_cmd_seq,
+            dispatch_metadata.stall_first,
+            dispatch_metadata.stall_before_program,
+            config_ahead,
+            config_ahead_waits);
         if (!covers_entire_mesh) {
             for (const auto* device : local_devices) {
                 chip_ids_in_workload.insert(device->id());
@@ -1361,6 +1425,7 @@ void FDMeshCommandQueue::reset_worker_state(
     const uint32_t max_fetch_size =
         MetalContext::instance(mesh_device_->impl().get_context_id()).dispatch_mem_map().max_prefetch_command_size();
     // Devices whose setup is the same share one copy of the deferred commands.
+    bool all_deferred = true;
     std::shared_ptr<const std::vector<uint32_t>> shared_commands;
     const vector_aligned<uint32_t>* shared_setup = nullptr;
     for (size_t i = 0; i < devices.size(); ++i) {
@@ -1381,15 +1446,67 @@ void FDMeshCommandQueue::reset_worker_state(
             devices[i]->sysmem_manager().defer_commands(shared_commands, id_);
             continue;
         }
+        all_deferred = false;
         program_dispatch::write_worker_dispatch_reset_commands(
             devices[i]->sysmem_manager(), id_, reset_commands, batches);
     }
+    // The Tensix kernel config ring space of the previous manager's programs that may not have finished, and where the
+    // next manager's ring starts: in the largest space clear of each sub-device's last program, so that the next
+    // program's config can be written ahead of the switch (write_program_commands_to_devices).
+    const auto& hal = MetalContext::instance(mesh_device_->impl().get_context_id()).hal();
+    const uint32_t tensix_index = hal.get_programmable_core_type_index(HalProgrammableCoreType::TENSIX);
+    std::vector<uint32_t> start_hints(hal.get_programmable_core_type_count(), 0);
+    std::vector<SwitchConfigInUse> in_use;
+    std::pair<uint32_t, uint32_t> bounds{0, 0};
+    for (uint32_t sub_device = 0; sub_device < config_buffer_mgr_.size(); sub_device++) {
+        const auto& mgr = config_buffer_mgr_[sub_device];
+        if (!mgr.configured()) {
+            continue;
+        }
+        bounds = mgr.bounds(tensix_index);
+        const auto queued = mgr.get_queued_entry_indices(tensix_index);
+        for (size_t i = 0; i < queued.size(); i++) {
+            const auto& entry = mgr.entry(queued[i], tensix_index);
+            if (entry.size != 0) {
+                in_use.push_back(
+                    {entry.addr, entry.addr + entry.size, sub_device, entry.sync_count, i + 1 == queued.size()});
+            }
+        }
+    }
+    if (bounds.second > bounds.first) {
+        // Free extents between the last programs' ranges; start in the largest.
+        std::vector<std::pair<uint32_t, uint32_t>> busy;
+        for (const auto& range : in_use) {
+            if (range.last) {
+                busy.emplace_back(range.lo, range.hi);
+            }
+        }
+        std::sort(busy.begin(), busy.end());
+        uint32_t best_start = bounds.first;
+        uint32_t best_size = 0;
+        uint32_t cursor = bounds.first;
+        for (const auto& [lo, hi] : busy) {
+            if (lo > cursor && lo - cursor > best_size) {
+                best_start = cursor;
+                best_size = lo - cursor;
+            }
+            cursor = std::max(cursor, hi);
+        }
+        if (bounds.second > cursor && bounds.second - cursor > best_size) {
+            best_start = cursor;
+        }
+        start_hints[tensix_index] = best_start == bounds.first ? 0 : best_start;
+    }
+    switch_config_in_use_ = all_deferred && reset_launch_msg_state
+                                ? std::optional<std::vector<SwitchConfigInUse>>(std::move(in_use))
+                                : std::nullopt;
     program_dispatch::reset_config_buf_mgrs_and_expected_workers(
-        MetalContext::instance(mesh_device_->impl().get_context_id()).hal(),
+        hal,
         config_buffer_mgr_,
         expected_num_workers_completed_,
         mesh_device_->num_sub_devices(),
-        mesh_device_->allocator_impl()->get_config().l1_unreserved_base);
+        mesh_device_->allocator_impl()->get_config().l1_unreserved_base,
+        start_hints);
     if (reset_launch_msg_state) {
         std::for_each(
             this->cq_shared_state_->worker_launch_message_buffer_state.begin(),
@@ -1402,7 +1519,9 @@ void FDMeshCommandQueue::write_program_commands_to_devices(
     const std::vector<Device*>& devices,
     ProgramCommandSequence& program_cmd_seq,
     bool stall_first,
-    bool stall_before_program) {
+    bool stall_before_program,
+    bool config_ahead,
+    ttsl::Span<const uint32_t> config_ahead_waits) {
     if (host_transfer_stats_->enabled() && !devices.empty()) {
         const auto target = this->get_target_device_type();
         if (target != tt::TargetDevice::Mock && target != tt::TargetDevice::Emule) {
@@ -1410,6 +1529,46 @@ void FDMeshCommandQueue::write_program_commands_to_devices(
                 HostTransferCategory::ProgramConfigFastDispatch,
                 devices.size() * program_cmd_seq.get_one_shot_fetch_size(stall_first, stall_before_program, true));
         }
+    }
+    if (config_ahead) {
+        // Waits for earlier programs whose config this overwrites, the config and binary, then the held-back switch
+        // commands (whose drain waits for the previous manager's programs), then the launch: in one fetch queue entry
+        // per device.
+        static thread_local vector_aligned<uint32_t> around;
+        uint32_t launch_offset =
+            program_dispatch::pack_program_command_sequence_around(program_cmd_seq, /*send_binary=*/true, around);
+        if (!config_ahead_waits.empty()) {
+            around.insert(around.begin(), config_ahead_waits.begin(), config_ahead_waits.end());
+            launch_offset += config_ahead_waits.size() * sizeof(uint32_t);
+        }
+        const uint32_t size = around.size() * sizeof(uint32_t);
+        const uint32_t max_fetch_size = program_cmd_seq.ctx->dispatch_mem_map().max_prefetch_command_size();
+        std::vector<Device*> remaining;
+        for (auto* device : devices) {
+            auto& manager = device->sysmem_manager();
+            const uint32_t deferred_size = manager.deferred_commands_size(id_);
+            if (deferred_size == 0 || deferred_size + size > max_fetch_size) {
+                remaining.push_back(device);
+                continue;
+            }
+            const auto deferred = manager.take_deferred_commands(id_);
+            manager.issue_queue_reserve(deferred_size + size, id_);
+            const uint32_t write_ptr = manager.get_issue_queue_write_ptr(id_);
+            manager.cq_write(around.data(), launch_offset, write_ptr);
+            manager.cq_write(deferred->data(), deferred_size, write_ptr + launch_offset);
+            manager.cq_write(
+                reinterpret_cast<const uint8_t*>(around.data()) + launch_offset,
+                size - launch_offset,
+                write_ptr + launch_offset + deferred_size);
+            manager.issue_queue_push_back(deferred_size + size, id_);
+            manager.fetch_queue_reserve_back(id_);
+            manager.fetch_queue_write(deferred_size + size, id_);
+        }
+        // The rest as usual: their switch commands, if any, go first.
+        if (!remaining.empty()) {
+            this->write_program_commands_to_devices(remaining, program_cmd_seq, stall_first, stall_before_program);
+        }
+        return;
     }
     if (devices.size() > 1) {
         const auto size = program_cmd_seq.get_one_shot_fetch_size(stall_first, stall_before_program, true);

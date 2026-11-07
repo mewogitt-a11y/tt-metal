@@ -88,6 +88,10 @@ public:
     // switch defers its commands to the next program this way. Any other issue_queue_reserve writes them first. Writes
     // them at once in bypass mode or on a mock device.
     void defer_commands(std::shared_ptr<const std::vector<uint32_t>> commands, uint8_t cq_id);
+    // Hands the deferred commands to the caller, which writes them itself.
+    std::shared_ptr<const std::vector<uint32_t>> take_deferred_commands(uint8_t cq_id) {
+        return std::move(deferred_commands_.at(cq_id));
+    }
     uint32_t deferred_commands_size(uint8_t cq_id) const {
         return cq_id < deferred_commands_.size() && deferred_commands_[cq_id]
                    ? deferred_commands_[cq_id]->size() * sizeof(uint32_t)
